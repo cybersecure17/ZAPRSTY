@@ -1,0 +1,90 @@
+variables:
+- name: ZAP_PORT
+  value: 8080
+- name: ZAP_API
+  value: http://localhost:8080
+- name: POSTMAN_API_KEY
+  value: PMAK-683b6fd48cf91c00011d869c-e9bfa87f26f582dadef0cb291a5ffa8570
+- name: COLLECTION_ID
+  value: "44996240-d221cfb0-91ee-41c2-8080-1fcdbe4e1485"
+stages:
+- stage: __default
+  jobs:
+  - job: Job
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - task: DockerInstaller@0
+      displayName: 'Install Docker'
+    - task: CmdLine@2
+      displayName: 'Start ZAP in Daemon Mode'
+      inputs:
+        script: |
+          docker run -u zap -d --name zap-weekly \
+          -p $(ZAP_PORT):$(ZAP_PORT) \
+          ghcr.io/zaproxy/zaproxy:weekly zap.sh \
+          -daemon -host 0.0.0.0 -port $(ZAP_PORT) -config api.disablekey=true
+          sleep 30
+    - task: CmdLine@2
+      displayName: 'Install Postman CLI'
+      inputs:
+        script: |
+          curl -o- "https://dl-cli.pstmn.io/install/linux64.sh" | sh
+    - task: CmdLine@2
+      displayName: 'Run Postman Collection'
+      inputs:
+        script: |
+          postman login --with-api-key $(POSTMAN_API_KEY)
+          postman collection run $(COLLECTION_ID) \
+            --reporters json \
+            --reporter-json-export result.json || true
+    - task: CmdLine@2
+      displayName: 'Extract Successful URLs from Postman Results'
+      inputs:
+        script: "sudo apt-get update && sudo apt-get install -y jq curl\n\njq -r '.run.executions[] \n  | select(.response.code >= 200 and .response.code < 300) \n  | .item.request.url.raw' result.json | sort -u > urls.txt\n\necho \"Extracted URLs:\"\ncat urls.txt\n"
+    - task: CmdLine@2
+      displayName: 'Spider and Active Scan via ZAP API'
+      inputs:
+        script: |
+          while IFS= read -r url; do
+            echo "Scanning $url"
+
+            echo "Accessing the URL"
+            curl "${ZAP_API}/JSON/core/action/accessUrl/?url=${url}&followRedirects=true"
+
+            echo "Spidering the URL"
+            scan_id=$(curl -s "${ZAP_API}/JSON/spider/action/scan/?url=${url}&recurse=true" | jq -r '.scan')
+
+            # Poll spider status
+            while true; do
+              status=$(curl -s "${ZAP_API}/JSON/spider/view/status/?scanId=${scan_id}" | jq -r '.status')
+              echo "Spider status: $status"
+              [[ "$status" == "100" ]] && break
+              sleep 5
+            done
+
+            echo "Running Active Scan"
+            act_scan_id=$(curl -s "${ZAP_API}/JSON/ascan/action/scan/?url=${url}" | jq -r '.scan')
+
+            # Poll active scan status
+            while true; do
+              act_status=$(curl -s "${ZAP_API}/JSON/ascan/view/status/?scanId=${act_scan_id}" | jq -r '.status')
+              echo "Active Scan status: $act_status"
+              [[ "$act_status" == "100" ]] && break
+              sleep 10
+            done
+
+            echo "Completed scan for $url"
+          done < urls.txt
+    - task: CmdLine@2
+      displayName: 'Generate ZAP HTML Report'
+      inputs:
+        script: |
+          curl "${ZAP_API}/OTHER/core/other/htmlreport/" -o zap_report.html
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: 'zap_report.html'
+        artifact: 'ZAP-DAST-Report'
+        publishLocation: 'pipeline'
+      displayName: 'Publish ZAP HTML Report'
+
